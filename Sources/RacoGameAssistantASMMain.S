@@ -45,6 +45,16 @@ str_forcestop:  .asciz "force-stop"
 str_app:        .asciz "com.kanagawa.yamada.project.raco"
 str_sh:         .asciz "sh"
 str_companion:  .asciz "COMPANION_MODE 1"
+str_playboost:  .asciz "RIPROG_PLAYBOOST 1"
+path_service:   .asciz "/system/bin/service"
+str_service_b:  .asciz "service"
+str_call:       .asciz "call"
+str_sf:         .asciz "SurfaceFlinger"
+str_1015:       .asciz "1015"
+str_1022:       .asciz "1022"
+str_i32:        .asciz "i32"
+str_f:          .asciz "f"
+str_one:        .asciz "1"
 
 /* argv arrays; the package slot (and the mode slot for load) is filled in
  * right before each spawn. */
@@ -62,14 +72,22 @@ argv_overlay_pkg:.quad 0
                 .quad str_service, 0
 argv_stop:      .quad str_am, str_forcestop, str_app, 0
 argv_ayunda:    .quad str_sh, path_ayscript, 0
+/* Per-game colour, the same two calls the C daemon makes through sh. The
+ * R/G/B/S slots point into wa_rgb, filled by wa_split_rgb from the file. */
+argv_sf_color:  .quad str_service_b, str_call, str_sf, str_1015, str_i32, str_one
+                .quad str_f, wa_rgb + 0,  str_f, str_zero, str_f, str_zero, str_f, str_zero, str_f, str_zero
+                .quad str_f, wa_rgb + 24, str_f, str_zero, str_f, str_zero, str_f, str_zero, str_f, str_zero
+                .quad str_f, wa_rgb + 48, str_f, str_zero, str_f, str_zero, str_f, str_zero, str_f, str_zero
+                .quad str_f, str_one, 0
+argv_sf_sat:    .quad str_service_b, str_call, str_sf, str_1022, str_f, wa_rgb + 72, 0
 
     .bss
     .align 4
 wa_path:        .skip 384
-wa_mode:        .skip 64
+wa_mode:        .skip 256
 wa_mode_str:    .skip 32
-wa_small:       .skip 64
-wa_raco:        .skip 512
+wa_rgb:         .skip 96
+wa_raco:        .skip 4096
 wa_cmdline:     .skip 256
 wa_buf:         .skip 32768
 wa_active_pid:  .skip 4
@@ -94,37 +112,6 @@ _start:
     b wa_exit
     .size _start, .-_start
 
-/* long wa_pid_score(int pid) -> oom_score_adj, or -1 if unreadable */
-    .global wa_pid_score
-    .type wa_pid_score, %function
-wa_pid_score:
-    stp x29, x30, [sp, #-16]!
-    mov x29, sp
-    sxtw x1, w0
-    adrp x0, wa_path
-    add x0, x0, :lo12:wa_path
-    adrp x2, leaf_score
-    add x2, x2, :lo12:leaf_score
-    bl wa_proc_path
-
-    adrp x1, wa_small
-    add x1, x1, :lo12:wa_small
-    mov x2, #63
-    bl wa_read_file
-    cmp x0, #0
-    b.lt .Lps_err
-
-    adrp x0, wa_small
-    add x0, x0, :lo12:wa_small
-    bl wa_atoi
-    b .Lps_out
-.Lps_err:
-    mov x0, #-1
-.Lps_out:
-    ldp x29, x30, [sp], #16
-    ret
-    .size wa_pid_score, .-wa_pid_score
-
 /* int wa_pid_cmdline(int pid, char *out, int cap) */
     .global wa_pid_cmdline
     .type wa_pid_cmdline, %function
@@ -148,35 +135,66 @@ wa_pid_cmdline:
     ret
     .size wa_pid_cmdline, .-wa_pid_cmdline
 
-/* int wa_is_companion(void) */
-    .global wa_is_companion
-    .type wa_is_companion, %function
-wa_is_companion:
-    stp x29, x30, [sp, #-16]!
+/* int wa_raco_has(const char *key) - a raco.txt line starts with key */
+    .global wa_raco_has
+    .type wa_raco_has, %function
+wa_raco_has:
+    stp x29, x30, [sp, #-32]!
+    str x19, [sp, #16]
     mov x29, sp
+    mov x19, x0
     adrp x0, path_racotxt
     add x0, x0, :lo12:path_racotxt
     adrp x1, wa_raco
     add x1, x1, :lo12:wa_raco
-    mov x2, #511
+    mov x2, #4095
     bl wa_read_file
     cmp x0, #0
-    b.lt .Lic_no
+    b.lt .Lrh_no
     adrp x0, wa_raco
     add x0, x0, :lo12:wa_raco
-    adrp x1, str_companion
-    add x1, x1, :lo12:str_companion
-    bl wa_strstr
-    cbnz x0, .Lic_yes
-.Lic_no:
+    mov x1, x19
+    bl wa_line_starts
+    b .Lrh_out
+.Lrh_no:
     mov x0, #0
-    b .Lic_out
-.Lic_yes:
-    mov x0, #1
-.Lic_out:
-    ldp x29, x30, [sp], #16
+.Lrh_out:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
     ret
+    .size wa_raco_has, .-wa_raco_has
+
+/* int wa_is_companion(void) */
+    .global wa_is_companion
+    .type wa_is_companion, %function
+wa_is_companion:
+    adrp x0, str_companion
+    add x0, x0, :lo12:str_companion
+    b wa_raco_has
     .size wa_is_companion, .-wa_is_companion
+
+/* int wa_touch(const char *path) - create if missing, 0 or -1 */
+    .global wa_touch
+    .type wa_touch, %function
+wa_touch:
+    mov x1, x0
+    mov x0, #-100             // AT_FDCWD
+    mov w2, #0x41             // O_CREAT | O_WRONLY
+    movz w3, #8, lsl #16      // O_CLOEXEC
+    orr w2, w2, w3
+    mov x3, #0644
+    mov x8, #56               // openat
+    svc #0
+    cmp x0, #0
+    b.lt .Lt_fail
+    mov x8, #57               // close
+    svc #0
+    mov x0, #0
+    ret
+.Lt_fail:
+    mov x0, #-1
+    ret
+    .size wa_touch, .-wa_touch
 
 /* void wa_run_load(const char *pkg) */
     .global wa_run_load
@@ -205,7 +223,7 @@ wa_run_load:
     add x0, x0, :lo12:wa_path
     adrp x1, wa_mode
     add x1, x1, :lo12:wa_mode
-    mov x2, #63
+    mov x2, #255
     bl wa_read_file
     cmp x0, #0
     b.le .Lrl_have_mode
@@ -213,8 +231,28 @@ wa_run_load:
     add x0, x0, :lo12:wa_mode
     bl wa_atoi              // stops at the first newline: line 1 only
     cmp x0, #0
-    b.le .Lrl_have_mode     // empty, garbage or negative: keep 4
+    b.le .Lrl_rgb           // empty, garbage or negative: keep 4
     mov x20, x0
+
+.Lrl_rgb:
+    // Line 2 "R G B S": Ayunda colour for this game, in the background
+    // like the C daemon's sh '&'.
+    adrp x0, wa_mode
+    add x0, x0, :lo12:wa_mode
+    adrp x1, wa_rgb
+    add x1, x1, :lo12:wa_rgb
+    bl wa_split_rgb
+    cbz w0, .Lrl_have_mode
+    adrp x0, path_ayflag
+    add x0, x0, :lo12:path_ayflag
+    bl wa_touch
+    adrp x0, path_service
+    add x0, x0, :lo12:path_service
+    adrp x1, argv_sf_color
+    add x1, x1, :lo12:argv_sf_color
+    adrp x2, argv_sf_sat
+    add x2, x2, :lo12:argv_sf_sat
+    bl wa_spawn_bg2
 .Lrl_have_mode:
     adrp x0, wa_mode_str
     add x0, x0, :lo12:wa_mode_str
@@ -231,6 +269,19 @@ wa_run_load:
     add x1, x1, :lo12:argv_load
     bl wa_spawn
 
+    // RiProg PlayBoost: open every thread of the game to all CPUs. Done
+    // after load, as in the C daemon, so the mode cannot undo it.
+    adrp x0, str_playboost
+    add x0, x0, :lo12:str_playboost
+    bl wa_raco_has
+    cbz w0, .Lrl_overlay
+    adrp x0, wa_active_pid
+    add x0, x0, :lo12:wa_active_pid
+    ldr w0, [x0]
+    cbz w0, .Lrl_overlay
+    bl wa_playboost
+
+.Lrl_overlay:
     bl wa_is_companion
     cbnz w0, .Lrl_out
 
@@ -312,14 +363,111 @@ wa_strip_colon:
     ret
     .size wa_strip_colon, .-wa_strip_colon
 
+/* int wa_find_fg(const char *want)
+ * Walks /dev/cpuset/top-app/cgroup.procs for a foreground process
+ * (oom_score_adj <= 300, readable) whose package, cmdline cut at ':', is
+ * want - or, when want is NULL, any package in the gamelist. Returns the pid
+ * and leaves the package in wa_cmdline, or 0 when nothing matches. */
+    .global wa_find_fg
+    .type wa_find_fg, %function
+wa_find_fg:
+    stp x29, x30, [sp, #-48]!
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x29, sp
+    mov x19, x0               // want
+
+    adrp x0, path_procs
+    add x0, x0, :lo12:path_procs
+    adrp x1, wa_buf
+    add x1, x1, :lo12:wa_buf
+    mov x2, #32767
+    bl wa_read_file
+    cmp x0, #0
+    b.lt .Lff_none
+
+    adrp x22, wa_buf
+    add x22, x22, :lo12:wa_buf
+    mov x21, #0
+
+.Lff_loop:
+    ldrb w0, [x22, x21]
+    cbz w0, .Lff_none
+    sub w0, w0, #48
+    cmp w0, #9
+    b.hi .Lff_next
+
+    add x0, x22, x21
+    bl wa_atoi
+    mov x20, x0
+.Lff_skip_digits:
+    ldrb w0, [x22, x21]
+    sub w0, w0, #48
+    cmp w0, #9
+    b.hi .Lff_have_pid        // NUL lands here too
+    add x21, x21, #1
+    b .Lff_skip_digits
+
+.Lff_have_pid:
+    cmp x20, #0
+    b.le .Lff_next
+
+    mov w0, w20
+    bl wa_pid_score
+    mov x1, #-9999            // unreadable is never foreground
+    cmp x0, x1
+    b.eq .Lff_next
+    cmp x0, #300
+    b.gt .Lff_next
+
+    mov w0, w20
+    adrp x1, wa_cmdline
+    add x1, x1, :lo12:wa_cmdline
+    mov x2, #255
+    bl wa_pid_cmdline
+    cmp x0, #0
+    b.le .Lff_next
+    adrp x0, wa_cmdline
+    add x0, x0, :lo12:wa_cmdline
+    ldrb w1, [x0]
+    cbz w1, .Lff_next
+    bl wa_strip_colon
+
+    adrp x0, wa_cmdline
+    add x0, x0, :lo12:wa_cmdline
+    cbz x19, .Lff_list
+    mov x1, x19
+    bl wa_strcmp_eq
+    b .Lff_match
+.Lff_list:
+    bl wa_gamelist_has
+.Lff_match:
+    cbz w0, .Lff_next
+    mov x0, x20
+    b .Lff_out
+
+.Lff_next:
+    // the digit skip may already sit on the NUL; never step past it
+    ldrb w0, [x22, x21]
+    cbz w0, .Lff_none
+    add x21, x21, #1
+    b .Lff_loop
+
+.Lff_none:
+    mov x0, #0
+.Lff_out:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+    .size wa_find_fg, .-wa_find_fg
+
 /* int wa_main(void) */
     .global wa_main
     .type wa_main, %function
 wa_main:
-    stp x29, x30, [sp, #-64]!
+    stp x29, x30, [sp, #-32]!
     stp x19, x20, [sp, #16]
-    stp x21, x22, [sp, #32]
-    stp x23, x24, [sp, #48]
     mov x29, sp
 
     bl wa_daemonize
@@ -337,19 +485,31 @@ wa_main:
 .Lm_loop:
     mov x0, #500
     bl wa_sleep_ms
+    bl wa_reap_all          // anything a timed-out wait left behind
 
     adrp x0, path_gamelist
     add x0, x0, :lo12:path_gamelist
-    bl wa_gamelist_reload
+    bl wa_gamelist_reload   // -1/-2 keep the cached list
 
     ldr w0, [x20]
     cbz w0, .Lm_scan
 
     bl wa_pid_score
-    cmn x0, #1
-    b.eq .Lm_unload
+    mov x1, #-9999
+    cmp x0, x1
+    b.eq .Lm_handover
     cmp x0, #300
     b.le .Lm_loop
+
+.Lm_handover:
+    // The tracked process went to the background or died. If another
+    // process of the same game is in front now, follow it and keep the mode.
+    adrp x0, wa_active_pkg
+    add x0, x0, :lo12:wa_active_pkg
+    bl wa_find_fg
+    cbz w0, .Lm_unload
+    str w0, [x20]
+    b .Lm_loop
 
 .Lm_unload:
     adrp x0, wa_active_pkg
@@ -359,73 +519,10 @@ wa_main:
     b .Lm_loop
 
 .Lm_scan:
-    adrp x0, path_procs
-    add x0, x0, :lo12:path_procs
-    adrp x1, wa_buf
-    add x1, x1, :lo12:wa_buf
-    mov x2, #32767
-    bl wa_read_file
-    cmp x0, #0
-    b.lt .Lm_loop
-
-    adrp x22, wa_buf
-    add x22, x22, :lo12:wa_buf
-    mov x21, #0
-
-.Lm_scan_loop:
-    ldrb w0, [x22, x21]
+    mov x0, #0
+    bl wa_find_fg
     cbz w0, .Lm_loop
-    cmp w0, #48
-    b.lt .Lm_scan_next
-    cmp w0, #57
-    b.gt .Lm_scan_next
-
-    add x0, x22, x21
-    bl wa_atoi
-    mov x23, x0
-
-.Lm_skip_digits:
-    ldrb w0, [x22, x21]
-    cbz w0, .Lm_have_pid
-    cmp w0, #48
-    b.lt .Lm_have_pid
-    cmp w0, #57
-    b.gt .Lm_have_pid
-    add x21, x21, #1
-    b .Lm_skip_digits
-
-.Lm_have_pid:
-    cmp x23, #0
-    b.le .Lm_scan_next
-
-    mov w0, w23
-    bl wa_pid_score
-    cmn x0, #1
-    b.eq .Lm_scan_next
-    cmp x0, #300
-    b.gt .Lm_scan_next
-
-    mov w0, w23
-    adrp x1, wa_cmdline
-    add x1, x1, :lo12:wa_cmdline
-    mov x2, #255
-    bl wa_pid_cmdline
-    cmp x0, #0
-    b.le .Lm_scan_next
-
-    adrp x0, wa_cmdline
-    add x0, x0, :lo12:wa_cmdline
-    ldrb w1, [x0]
-    cbz w1, .Lm_scan_next
-
-    bl wa_strip_colon
-
-    adrp x0, wa_cmdline
-    add x0, x0, :lo12:wa_cmdline
-    bl wa_gamelist_has
-    cbz w0, .Lm_scan_next
-
-    str w23, [x20]
+    str w0, [x20]
     adrp x0, wa_active_pkg
     add x0, x0, :lo12:wa_active_pkg
     adrp x1, wa_cmdline
@@ -436,18 +533,9 @@ wa_main:
     bl wa_run_load
     b .Lm_loop
 
-.Lm_scan_next:
-    // wa_skip_digits may already sit on the NUL; never step past it
-    ldrb w0, [x22, x21]
-    cbz w0, .Lm_loop
-    add x21, x21, #1
-    b .Lm_scan_loop
-
 .Lm_exit:
     mov x0, #0
-    ldp x23, x24, [sp, #48]
-    ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #64
+    ldp x29, x30, [sp], #32
     ret
     .size wa_main, .-wa_main

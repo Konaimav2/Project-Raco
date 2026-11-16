@@ -56,15 +56,15 @@ if ! $TOOLCHAIN/aarch64-linux-android$API-clang -Wall -O2 -I"$SRC_DIR" \
   exit 1
 fi
 
-echo "Building Raco Game Assistant Service (Daemon)..."
-if ! $TOOLCHAIN/aarch64-linux-android$API-clang -Wall -O2 -I"$SRC_DIR" \
-  -o "$MODULES_DIR/CoreSys/RacoGameAssistantService" \
-  "$SRC_DIR/RacoGameAssistant.c" \
-  "$SRC_DIR/RacoGameAssistantLibrary.s"; then
+echo "Building Raco Game Assistant Service (Daemon, assembly)..."
+# RacoGameAssistant.c stays in Sources for reference; the shipped daemon is
+# the libc-free assembly build.
+if ! CC="$TOOLCHAIN/clang" NM="$TOOLCHAIN/llvm-nm" STRIP="$TOOLCHAIN/llvm-strip" \
+  READELF="$TOOLCHAIN/llvm-readelf" \
+  sh Modular/CompileGameAssistantASM.sh "$MODULES_DIR/CoreSys/RacoGameAssistantService"; then
   echo " ERROR: Compilation of Raco Game Assistant Service failed!"
   exit 1
 fi
-$TOOLCHAIN/llvm-strip "$MODULES_DIR/CoreSys/RacoGameAssistantService"
 
 echo "[4/6] Building Anya Standalone..."
 if ! $TOOLCHAIN/aarch64-linux-android$API-clang -Wall -O2 -I"$SRC_DIR" -DSTANDALONE \

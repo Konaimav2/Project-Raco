@@ -6,10 +6,17 @@
  * touching that file. Exported for tests:
  *   long long wa_now_ms(void);
  *   int  wa_read_file(const char *path, char *buf, int cap);
- *   int  wa_gamelist_reload(const char *path);   // 1 changed, 0 same, -1 error
+ *   int  wa_gamelist_reload(const char *path);   // 1 changed, 0 same, -1 error,
+ *                                                // -2 over 64 KiB (cache kept)
  *   int  wa_gamelist_has(const char *pkg);       // whole-line match
  *   int  wa_instance_lock(const char *path);     // fd or -1
  *   void wa_instance_unlock(int fd);
+ *   long wa_pid_score(int pid);                  // oom_score_adj or -9999
+ *   int  wa_spawn_timeout(path, argv, max_ms);   // status, -2 killed, -1
+ *   int  wa_spawn_bg2(path, argv1, argv2);       // "a ; b &"
+ *   int  wa_split_rgb(text, out[4][24]);         // Ayunda line 2
+ *   int  wa_playboost(int pid);                  // threads set to CPUs 0-7
+ * Further helpers are documented where they are defined.
  */
 
     .equ AT_FDCWD,        -100
@@ -25,12 +32,12 @@
     .equ SYS_READ,         63
     .equ SYS_FLOCK,        32
     .equ CLOCK_MONOTONIC,  1
-    .equ GAMELIST_MAX,     4096
+    .equ GAMELIST_MAX,     65536    // a bigger list is refused, never cut
 
     .bss
     .align 4
-wa_tmp:             .skip GAMELIST_MAX
-gamelist:           .skip GAMELIST_MAX
+wa_tmp:             .skip GAMELIST_MAX + 16
+gamelist:           .skip GAMELIST_MAX + 16
 gamelist_len:       .skip 8
 wa_out:             .skip 8
 
@@ -306,7 +313,10 @@ wa_read_file:
     .size wa_read_file, .-wa_read_file
 
 /* int wa_gamelist_reload(const char *path)
- * Reads the list into a temp buffer, swaps it in only when it changed. */
+ * Reads the list into a temp buffer, swaps it in only when it changed.
+ * 1 changed, 0 same, -1 unreadable, -2 larger than GAMELIST_MAX bytes.
+ * On -1 and -2 the cached list stays as it was: a list that does not fit is
+ * never matched partially. */
     .global wa_gamelist_reload
     .type wa_gamelist_reload, %function
 wa_gamelist_reload:
@@ -318,11 +328,14 @@ wa_gamelist_reload:
     adrp x1, wa_tmp
     add x1, x1, :lo12:wa_tmp
     mov x2, #GAMELIST_MAX
-    sub x2, x2, #1
+    add x2, x2, #2            // room to see one byte past the limit
     bl wa_read_file
     cmp x0, #0
     b.lt .Lgr_err
     mov x19, x0             // new len
+    mov x1, #GAMELIST_MAX
+    cmp x19, x1
+    b.gt .Lgr_toobig
 
     adrp x20, gamelist
     add x20, x20, :lo12:gamelist
@@ -368,6 +381,9 @@ wa_gamelist_reload:
     mov x0, #1
     b .Lgr_out
 
+.Lgr_toobig:
+    mov x0, #-2
+    b .Lgr_out
 .Lgr_err:
     mov x0, #-1
 .Lgr_out:
@@ -591,38 +607,117 @@ wa_unlink:
     ret
     .size wa_unlink, .-wa_unlink
 
-/* int wa_spawn(const char *path, char *const argv[])
- * fork + execve(path, argv, wa_envp); the child exits 127 if exec fails.
- * Returns the raw wait status, or -1 if fork failed. */
-    .global wa_spawn
-    .type wa_spawn, %function
-wa_spawn:
-    stp x29, x30, [sp, #-64]!
+/* int wa_wait_bounded(int pid, long max_ms)
+ * Polls wait4(pid, WNOHANG) every 50 ms for up to max_ms. A child still
+ * running after that gets SIGKILL and is reaped (up to 1 s more; anything
+ * slower is left to wa_reap_all on the next tick).
+ * Returns the wait status, -2 when it had to kill, -1 when wait4 failed. */
+    .equ WNOHANG,          1
+    .equ SYS_KILL,         129
+    .equ SIGKILL,          9
+    .global wa_wait_bounded
+    .type wa_wait_bounded, %function
+wa_wait_bounded:
+    stp x29, x30, [sp, #-48]!
     stp x19, x20, [sp, #16]
-    stp x21, x22, [sp, #32]
+    str x21, [sp, #32]
     mov x29, sp
-    mov x19, x0
-    mov x20, x1
-    bl wa_fork
-    cmp x0, #0
-    b.lt .Lsp_fail
-    b.eq .Lsp_child
-    mov x21, x0               // child pid
-    str wzr, [sp, #48]        // wait status slot, clear of the saved regs
-.Lsp_wait:
-    mov x0, x21
-    add x1, sp, #48
-    mov x2, #0
+    sxtw x19, w0
+    mov x20, x1               // ms left
+    str wzr, [sp, #40]        // wait status slot
+.Lwb_poll:
+    mov x0, x19
+    add x1, sp, #40
+    mov x2, #WNOHANG
     mov x3, #0
     mov x8, #SYS_WAIT4
     svc #0
     cmn x0, #EINTR
-    b.eq .Lsp_wait
+    b.eq .Lwb_poll
     cmp x0, #0
-    b.lt .Lsp_fail
-    ldr w0, [sp, #48]
-    b .Lsp_out
-.Lsp_child:
+    b.lt .Lwb_err
+    b.gt .Lwb_done
+    cmp x20, #0
+    b.le .Lwb_kill
+    mov x0, #50
+    bl wa_sleep_ms
+    sub x20, x20, #50
+    b .Lwb_poll
+.Lwb_kill:
+    mov x0, x19
+    mov x1, #SIGKILL
+    mov x8, #SYS_KILL
+    svc #0
+    mov x21, #20
+.Lwb_reap:
+    mov x0, x19
+    add x1, sp, #40
+    mov x2, #WNOHANG
+    mov x3, #0
+    mov x8, #SYS_WAIT4
+    svc #0
+    cmn x0, #EINTR
+    b.eq .Lwb_reap
+    cbnz x0, .Lwb_timeout     // reaped, or already gone
+    subs x21, x21, #1
+    b.eq .Lwb_timeout
+    mov x0, #50
+    bl wa_sleep_ms
+    b .Lwb_reap
+.Lwb_timeout:
+    mov x0, #-2
+    b .Lwb_out
+.Lwb_done:
+    ldr w0, [sp, #40]
+    b .Lwb_out
+.Lwb_err:
+    mov x0, #-1
+.Lwb_out:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+    .size wa_wait_bounded, .-wa_wait_bounded
+
+/* void wa_reap_all(void) - collect any exited child without blocking */
+    .global wa_reap_all
+    .type wa_reap_all, %function
+wa_reap_all:
+    mov x0, #-1
+    mov x1, #0
+    mov x2, #WNOHANG
+    mov x3, #0
+    mov x8, #SYS_WAIT4
+    svc #0
+    cmn x0, #EINTR
+    b.eq wa_reap_all
+    cmp x0, #0
+    b.gt wa_reap_all
+    ret
+    .size wa_reap_all, .-wa_reap_all
+
+/* int wa_spawn_timeout(const char *path, char *const argv[], long max_ms)
+ * fork + execve(path, argv, wa_envp); the child exits 127 if exec fails.
+ * Waits at most max_ms (see wa_wait_bounded). Returns the raw wait status,
+ * -2 if the program was killed for running too long, -1 on fork failure. */
+    .global wa_spawn_timeout
+    .type wa_spawn_timeout, %function
+wa_spawn_timeout:
+    stp x29, x30, [sp, #-48]!
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x29, sp
+    mov x19, x0
+    mov x20, x1
+    mov x21, x2
+    bl wa_fork
+    cmp x0, #0
+    b.lt .Lst_fail
+    b.eq .Lst_child
+    mov x1, x21
+    bl wa_wait_bounded
+    b .Lst_out
+.Lst_child:
     mov x0, x19
     mov x1, x20
     adrp x2, wa_envp
@@ -632,34 +727,52 @@ wa_spawn:
     svc #0
     mov x0, #127
     b wa_exit
-.Lsp_fail:
+.Lst_fail:
     mov x0, #-1
-.Lsp_out:
-    ldp x21, x22, [sp, #32]
+.Lst_out:
+    ldr x21, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #64
+    ldp x29, x30, [sp], #48
     ret
+    .size wa_spawn_timeout, .-wa_spawn_timeout
+
+/* int wa_spawn(const char *path, char *const argv[]) - 3 s limit */
+    .global wa_spawn
+    .type wa_spawn, %function
+wa_spawn:
+    mov x2, #3000
+    b wa_spawn_timeout
     .size wa_spawn, .-wa_spawn
 
-/* int wa_spawn_bg(const char *path, char *const argv[])
- * Same as wa_spawn but does not wait for the program: an intermediate child
- * forks the real one and exits at once, so nothing is left as a zombie.
+/* int wa_spawn_bg2(const char *path, char *const argv1[], char *const argv2[])
+ * Runs path with argv1 and then (when argv2 is not NULL) path with argv2, in
+ * the background like "a ; b &" in sh: an intermediate child forks the
+ * worker and exits at once, so nothing is left as a zombie and the caller
+ * does not wait for the programs. The worker gives argv1 the usual 3 s limit.
  * Returns the intermediate child's wait status, or -1. */
-    .global wa_spawn_bg
-    .type wa_spawn_bg, %function
-wa_spawn_bg:
+    .global wa_spawn_bg2
+    .type wa_spawn_bg2, %function
+wa_spawn_bg2:
     stp x29, x30, [sp, #-48]!
     stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
     mov x29, sp
     mov x19, x0
     mov x20, x1
+    mov x21, x2
     bl wa_fork
     cmp x0, #0
     b.lt .Lsb_fail
     b.ne .Lsb_parent
-    // intermediate child: start the program, never wait for it
+    // intermediate child: start the worker, never wait for it
     bl wa_fork
     cbnz x0, .Lsb_mid_exit    // pid or error: either way we are done
+    cbz x21, .Lsb_last
+    mov x0, x19
+    mov x1, x20
+    bl wa_spawn
+    mov x20, x21
+.Lsb_last:
     mov x0, x19
     mov x1, x20
     adrp x2, wa_envp
@@ -673,27 +786,24 @@ wa_spawn_bg:
     mov x0, #0
     b wa_exit
 .Lsb_parent:
-    mov x19, x0
-    str wzr, [sp, #32]        // wait status slot, clear of the saved regs
-.Lsb_wait:
-    mov x0, x19
-    add x1, sp, #32
-    mov x2, #0
-    mov x3, #0
-    mov x8, #SYS_WAIT4
-    svc #0
-    cmn x0, #EINTR
-    b.eq .Lsb_wait
-    cmp x0, #0
-    b.lt .Lsb_fail
-    ldr w0, [sp, #32]
+    mov x1, #3000
+    bl wa_wait_bounded
     b .Lsb_out
 .Lsb_fail:
     mov x0, #-1
 .Lsb_out:
+    ldr x21, [sp, #32]
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+    .size wa_spawn_bg2, .-wa_spawn_bg2
+
+/* int wa_spawn_bg(const char *path, char *const argv[]) */
+    .global wa_spawn_bg
+    .type wa_spawn_bg, %function
+wa_spawn_bg:
+    mov x2, #0
+    b wa_spawn_bg2
     .size wa_spawn_bg, .-wa_spawn_bg
 
 /* int wa_daemonize(void)
@@ -791,3 +901,310 @@ wa_proc_path:
     ldp x29, x30, [sp], #48
     ret
     .size wa_proc_path, .-wa_proc_path
+
+/* ------------------------------------------------------------------------
+ * oom_score_adj. -1 is a legal score, so errors come back as WA_NO_SCORE
+ * (-9999), the same sentinel RacoGameAssistant.c uses.
+ * ------------------------------------------------------------------------ */
+    .equ WA_NO_SCORE,      -9999
+
+    .bss
+    .align 3
+wa_sc_path:         .skip 64
+wa_sc_buf:          .skip 32
+wa_pb_path:         .skip 64
+    .align 3
+wa_dents:           .skip 4096
+
+    .section .rodata
+wa_str_score:       .asciz "oom_score_adj"
+wa_str_task:        .asciz "task"
+    .text
+
+/* long wa_score_parse(const char *s)
+ * The number at the start of s (after blanks), or -9999 when there is none. */
+    .global wa_score_parse
+    .type wa_score_parse, %function
+wa_score_parse:
+    mov x1, x0
+.Lsp2_ws:
+    ldrb w2, [x1]
+    cmp w2, #32
+    b.eq .Lsp2_adv
+    sub w3, w2, #9
+    cmp w3, #4
+    b.hi .Lsp2_sign
+.Lsp2_adv:
+    add x1, x1, #1
+    b .Lsp2_ws
+.Lsp2_sign:
+    cmp w2, #45               // '-'
+    b.eq .Lsp2_signed
+    cmp w2, #43               // '+'
+    b.ne .Lsp2_digit
+.Lsp2_signed:
+    ldrb w2, [x1, #1]
+.Lsp2_digit:
+    sub w3, w2, #48
+    cmp w3, #9
+    b.hi .Lsp2_none
+    b wa_atoi                 // x0 still points at the text
+.Lsp2_none:
+    mov x0, #WA_NO_SCORE
+    ret
+    .size wa_score_parse, .-wa_score_parse
+
+/* long wa_pid_score(int pid) -> oom_score_adj, or -9999 if unreadable */
+    .global wa_pid_score
+    .type wa_pid_score, %function
+wa_pid_score:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    sxtw x1, w0
+    adrp x0, wa_sc_path
+    add x0, x0, :lo12:wa_sc_path
+    adrp x2, wa_str_score
+    add x2, x2, :lo12:wa_str_score
+    bl wa_proc_path
+    adrp x1, wa_sc_buf
+    add x1, x1, :lo12:wa_sc_buf
+    mov x2, #31
+    bl wa_read_file
+    cmp x0, #0
+    b.le .Lpsc_err
+    adrp x0, wa_sc_buf
+    add x0, x0, :lo12:wa_sc_buf
+    bl wa_score_parse
+    b .Lpsc_out
+.Lpsc_err:
+    mov x0, #WA_NO_SCORE
+.Lpsc_out:
+    ldp x29, x30, [sp], #16
+    ret
+    .size wa_pid_score, .-wa_pid_score
+
+/* int wa_strcmp_eq(const char *a, const char *b) - 1 when equal */
+    .global wa_strcmp_eq
+    .type wa_strcmp_eq, %function
+wa_strcmp_eq:
+    ldrb w2, [x0], #1
+    ldrb w3, [x1], #1
+    cmp w2, w3
+    b.ne .Lse_no
+    cbnz w2, wa_strcmp_eq
+    mov x0, #1
+    ret
+.Lse_no:
+    mov x0, #0
+    ret
+    .size wa_strcmp_eq, .-wa_strcmp_eq
+
+/* int wa_line_starts(const char *text, const char *key)
+ * 1 when some line of text begins with key, as strncmp(line, key, len) on
+ * each fgets() line does in the C daemon. */
+    .global wa_line_starts
+    .type wa_line_starts, %function
+wa_line_starts:
+    mov x2, x0                // line start
+.Lls_line:
+    mov x3, x2
+    mov x4, x1
+.Lls_cmp:
+    ldrb w5, [x4]
+    cbz w5, .Lls_yes
+    ldrb w6, [x3]
+    cmp w5, w6
+    b.ne .Lls_skip
+    add x3, x3, #1
+    add x4, x4, #1
+    b .Lls_cmp
+.Lls_skip:
+    ldrb w6, [x2]
+    cbz w6, .Lls_no
+    add x2, x2, #1
+    cmp w6, #10
+    b.ne .Lls_skip
+    b .Lls_line
+.Lls_yes:
+    mov x0, #1
+    ret
+.Lls_no:
+    mov x0, #0
+    ret
+    .size wa_line_starts, .-wa_line_starts
+
+/* int wa_split_rgb(const char *text, char out[4][24])
+ * Line 2 of a modes/<pkg> file is "R G B S". Copies the first four tokens
+ * into out as text, unchanged, and returns 1 when there are at least four
+ * and each is a plain decimal ([+-]digits[.digits], at most 23 chars).
+ * Returns 0 otherwise; out is then unspecified. */
+    .global wa_split_rgb
+    .type wa_split_rgb, %function
+wa_split_rgb:
+.Lsr_find:
+    ldrb w2, [x0], #1
+    cbz w2, .Lsr_no
+    cmp w2, #10
+    b.ne .Lsr_find
+    mov x3, #0                // tokens done
+.Lsr_ws:
+    ldrb w2, [x0]
+    cmp w2, #32
+    b.eq .Lsr_adv
+    cmp w2, #9
+    b.eq .Lsr_adv
+    cmp w2, #13
+    b.eq .Lsr_adv
+    cbz w2, .Lsr_no
+    cmp w2, #10
+    b.eq .Lsr_no
+    mov x5, #24
+    madd x4, x3, x5, x1       // out slot
+    mov x6, #0                // length
+    mov x7, #0                // digits
+    mov x9, #0                // dots
+.Lsr_tok:
+    ldrb w2, [x0]
+    cbz w2, .Lsr_end
+    cmp w2, #32
+    b.eq .Lsr_end
+    cmp w2, #9
+    b.eq .Lsr_end
+    cmp w2, #13
+    b.eq .Lsr_end
+    cmp w2, #10
+    b.eq .Lsr_end
+    cmp x6, #23
+    b.hs .Lsr_no
+    sub w10, w2, #48
+    cmp w10, #9
+    b.hi .Lsr_notdig
+    add x7, x7, #1
+    b .Lsr_store
+.Lsr_notdig:
+    cmp w2, #46               // '.'
+    b.ne .Lsr_sign
+    add x9, x9, #1
+    cmp x9, #1
+    b.gt .Lsr_no
+    b .Lsr_store
+.Lsr_sign:
+    cmp w2, #45               // '-'
+    b.eq .Lsr_signok
+    cmp w2, #43               // '+'
+    b.ne .Lsr_no
+.Lsr_signok:
+    cbnz x6, .Lsr_no          // a sign only leads
+.Lsr_store:
+    strb w2, [x4, x6]
+    add x6, x6, #1
+    add x0, x0, #1
+    b .Lsr_tok
+.Lsr_end:
+    cbz x7, .Lsr_no
+    strb wzr, [x4, x6]
+    add x3, x3, #1
+    cmp x3, #4
+    b.eq .Lsr_yes
+    b .Lsr_ws
+.Lsr_adv:
+    add x0, x0, #1
+    b .Lsr_ws
+.Lsr_yes:
+    mov x0, #1
+    ret
+.Lsr_no:
+    mov x0, #0
+    ret
+    .size wa_split_rgb, .-wa_split_rgb
+
+/* int wa_playboost(int pid)
+ * Lets every thread of pid run on CPUs 0-7: walks /proc/<pid>/task with
+ * getdents64 and calls sched_setaffinity(tid, 8, {0xff}) on each.
+ * Returns how many threads took the mask, or -1 if the task dir is gone. */
+    .equ SYS_GETDENTS64,   61
+    .equ SYS_SCHED_SETAFFINITY, 122
+    .equ O_DIRECTORY,      040000
+    .equ WA_CPU_MASK,      0xff
+    .global wa_playboost
+    .type wa_playboost, %function
+wa_playboost:
+    stp x29, x30, [sp, #-80]!
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x29, sp
+    sxtw x1, w0               // pid
+    mov x2, #WA_CPU_MASK
+    str x2, [sp, #64]         // cpu_set_t, 8 bytes
+    mov x20, #0               // threads pinned
+
+    adrp x0, wa_pb_path
+    add x0, x0, :lo12:wa_pb_path
+    adrp x2, wa_str_task
+    add x2, x2, :lo12:wa_str_task
+    bl wa_proc_path
+    mov x1, x0
+    mov x0, #AT_FDCWD
+    mov w2, #O_DIRECTORY
+    movz w3, #8, lsl #16      // O_CLOEXEC
+    orr w2, w2, w3
+    mov x3, #0
+    mov x8, #SYS_OPENAT
+    svc #0
+    cmp x0, #0
+    b.lt .Lpb_fail
+    mov x19, x0               // dir fd
+
+.Lpb_read:
+    mov x0, x19
+    adrp x1, wa_dents
+    add x1, x1, :lo12:wa_dents
+    mov x2, #4096
+    mov x8, #SYS_GETDENTS64
+    svc #0
+    cmp x0, #0
+    b.le .Lpb_done
+    mov x21, x0               // bytes in this batch
+    mov x22, #0               // offset
+.Lpb_ent:
+    cmp x22, x21
+    b.hs .Lpb_read
+    adrp x23, wa_dents
+    add x23, x23, :lo12:wa_dents
+    add x23, x23, x22         // struct linux_dirent64
+    ldrh w24, [x23, #16]      // d_reclen
+    cbz w24, .Lpb_done        // malformed, stop rather than spin
+    ldrb w0, [x23, #19]       // d_name[0]
+    sub w0, w0, #48
+    cmp w0, #9
+    b.hi .Lpb_next            // "." and ".."
+    add x0, x23, #19
+    bl wa_atoi
+    cmp x0, #0
+    b.le .Lpb_next
+    mov x1, #8
+    add x2, sp, #64
+    mov x8, #SYS_SCHED_SETAFFINITY
+    svc #0
+    cbnz x0, .Lpb_next
+    add x20, x20, #1
+.Lpb_next:
+    add x22, x22, x24
+    b .Lpb_ent
+
+.Lpb_done:
+    mov x0, x19
+    mov x8, #SYS_CLOSE
+    svc #0
+    mov x0, x20
+    b .Lpb_out
+.Lpb_fail:
+    mov x0, #-1
+.Lpb_out:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+    .size wa_playboost, .-wa_playboost
