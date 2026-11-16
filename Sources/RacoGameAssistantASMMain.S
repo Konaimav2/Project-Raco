@@ -92,6 +92,7 @@ wa_cmdline:     .skip 256
 wa_buf:         .skip 32768
 wa_active_pid:  .skip 4
 wa_active_pkg:  .skip 256
+wa_overlay_tick: .skip 4
 
     .text
 
@@ -196,6 +197,27 @@ wa_touch:
     ret
     .size wa_touch, .-wa_touch
 
+/* void wa_send_overlay(const char *pkg)
+ * Re-issues the app's overlay intent. The app drops its overlay when the
+ * screen turns off and never re-adds it, so the daemon refreshes it while a
+ * game is active. Re-sending is idempotent (one window, no duplicates). */
+    .global wa_send_overlay
+    .type wa_send_overlay, %function
+wa_send_overlay:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    adrp x1, argv_overlay_pkg
+    add x1, x1, :lo12:argv_overlay_pkg
+    str x0, [x1]
+    adrp x0, path_cmd
+    add x0, x0, :lo12:path_cmd
+    adrp x1, argv_overlay
+    add x1, x1, :lo12:argv_overlay
+    bl wa_spawn
+    ldp x29, x30, [sp], #16
+    ret
+    .size wa_send_overlay, .-wa_send_overlay
+
 /* void wa_run_load(const char *pkg) */
     .global wa_run_load
     .type wa_run_load, %function
@@ -284,15 +306,8 @@ wa_run_load:
 .Lrl_overlay:
     bl wa_is_companion
     cbnz w0, .Lrl_out
-
-    adrp x1, argv_overlay_pkg
-    add x1, x1, :lo12:argv_overlay_pkg
-    str x19, [x1]
-    adrp x0, path_cmd
-    add x0, x0, :lo12:path_cmd
-    adrp x1, argv_overlay
-    add x1, x1, :lo12:argv_overlay
-    bl wa_spawn
+    mov x0, x19
+    bl wa_send_overlay
 .Lrl_out:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
@@ -499,7 +514,7 @@ wa_main:
     cmp x0, x1
     b.eq .Lm_handover
     cmp x0, #300
-    b.le .Lm_loop
+    b.le .Lm_keep
 
 .Lm_handover:
     // The tracked process went to the background or died. If another
@@ -531,6 +546,25 @@ wa_main:
     adrp x0, wa_active_pkg
     add x0, x0, :lo12:wa_active_pkg
     bl wa_run_load
+    b .Lm_loop
+
+.Lm_keep:
+    // The app drops its overlay on screen off and never re-adds it. Refresh
+    // the intent every 60 ticks (30 s at 500 ms) while a game is active.
+    adrp x1, wa_overlay_tick
+    add x1, x1, :lo12:wa_overlay_tick
+    ldr w2, [x1]
+    add w2, w2, #1
+    cmp w2, #60
+    b.lo .Lm_keep_save
+    mov w2, #0
+    str w2, [x1]
+    adrp x0, wa_active_pkg
+    add x0, x0, :lo12:wa_active_pkg
+    bl wa_send_overlay
+    b .Lm_loop
+.Lm_keep_save:
+    str w2, [x1]
     b .Lm_loop
 
 .Lm_exit:
