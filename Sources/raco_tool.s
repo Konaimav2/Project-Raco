@@ -70,8 +70,8 @@ raco_write:
     mov x3, #0                // No flags
     mov x8, #SYS_FCHMODAT     // Load Syscall for FCHMODAT
     svc #0                    // Trigger Kernel System Call
-    cmp x0, #0
-    blt .L_write_fail         // If fchmodat fails, jump to fail
+    // chmod is best-effort: procfs sysctl entries reject it with EPERM,
+    // but they are still writable. Only a failing open/write aborts below.
 
     // Open file
     mov x0, #AT_FDCWD         // Directory of FD
@@ -96,8 +96,8 @@ raco_write:
     mov x1, #PERM_444         // Change to perm 444
     mov x8, #SYS_FCHMOD       // Load Syscall for FCHMOD
     svc #0                    // Trigger Kernel System Call
-    cmp x0, #0
-    blt .L_write_fail         // If fchmod fails, jump to fail
+    // Restoring 444 is best-effort too; procfs rejects it and the write above
+    // already happened.
 
     // Close File
     mov x0, x22               // File descriptor x22 into x0
@@ -150,8 +150,7 @@ raco_kakikomi:
     mov x3, #0                // No flags
     mov x8, #SYS_FCHMODAT     // Load Syscall for FCHMODAT
     svc #0                    // Trigger Kernel System Call
-    cmp x0, #0
-    blt .L_kaki_fail          // If fchmodat fails, jump to fail
+    // Same as raco_write: chmod failure is not fatal, the open below decides.
 
     // Open file
     mov x0, #AT_FDCWD         // Directory of FD
